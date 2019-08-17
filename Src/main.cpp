@@ -52,6 +52,7 @@
 #include <time.h>
 
 #include "Utils/cli.h"
+#include "Utils/crc.h"
 #include "Utils/terminal_serial.h"
 #include "stm32f1xx_hal.h"
 
@@ -64,8 +65,18 @@
 #include "centurion_gate.h"
 #include "driveway_motors.h"
 
-uint8_t netAddress[] = {0x04, 0x44, 0x55};
-#define payload_length 16
+#define STREET_NODE_ADDRESS     0x00
+#define UPS_NODE_ADDRESS        0x01
+#define UPS12V_NODE_ADDRESS     0x02
+#define FERMENTER_NODE_ADDRESS  0x03
+#define HOUSE_NODE_ADDRESS      0x04
+#define GARAGE_NODE_ADDRESS     0x05
+#define WATER_NODE_ADDRESS      0x06
+
+#define NODE_ADDRESS HOUSE_NODE_ADDRESS
+
+uint8_t netAddress[] = {0x23, 0x1B, 0x25};
+uint8_t serverAddress[] = {0x12, 0x3B, 0x45};
 
 /* Private variables ---------------------------------------------------------*/
 RTC_HandleTypeDef hrtc;
@@ -87,13 +98,27 @@ static void MX_TIM2_Init(void);
 }
 
 /* Private function prototypes -----------------------------------------------*/
+enum nodeFrameType_e
+{
+	DATA = 0,
+	COMMAND = 1,
+	ACKNOWLEDGE = 2
+};
+
+//Node send 32 bytes of data, with the last byte being the 8-bit CRC
 typedef struct {
-	uint32_t timestamp;		//4
-	uint8_t inputs;			//1
-	uint8_t outputs;		//1
-	uint16_t voltages[4];	//8
-	uint16_t temperature;	//2
+	uint8_t nodeAddress;	//1
+	uint8_t frameType;		//1
+	uint32_t timestamp;		//4  6
+	uint8_t inputs;			//1  7
+	uint8_t outputs;		//1  8
+	uint16_t voltages[4];	//8  16
+	uint16_t temperature;	//2  18
+	uint8_t reserved[13]; 	//13 31
+	uint8_t crc;			//1  32
 }__attribute__((packed, aligned(4))) nodeData_s;
+
+bool reportToServer = false;
 
 uint32_t getADCstep()
 {
@@ -174,18 +199,24 @@ void report(uint8_t *address)
 {
 //	printf("NOT reporting\n");
 	nodeData_s pay;
-	memset(&pay, 0, 16);
+	memset(&pay, 0, 32);
+	pay.nodeAddress = NODE_ADDRESS;
 	pay.timestamp = HAL_GetTick();
 	pay.temperature = getTemperature();
 
 	//report gate status in voltages[0-1]
 	pay.voltages[0] = houseGate.getState();
-	printf("TX result %d\n", InterfaceNRF24::get()->transmit(address, (uint8_t*)&pay, 16));
+
+
+	pay.crc = CRC_8::crc((uint8_t*)&pay, 31);
+
+	//report status in voltages[0-1]
+	printf("TX result %d\n", InterfaceNRF24::get()->transmit(address, (uint8_t*)&pay, 32));
 }
 
 void reportNow()
 {
-	report(netAddress);
+	report(serverAddress);
 }
 
 bool isDay()
@@ -203,12 +234,45 @@ bool isDay()
 
 bool NRFreceivedCB(int pipe, uint8_t *data, int len)
 {
-	printf("RCV PIPE# %d\n", (int)pipe);
-	printf(" PAYLOAD: %d\n", len);
-	diag_dump_buf(data, len);
+	if(pipe != 0)
+	{
+		printf(RED("%d NOT correct pipe\n"), pipe);
+		return false;
+	}
 
+
+	if(CRC_8::crc(data, 32))
+	{
+		printf(RED("CRC error\n"));
+		return false;
+	}
+
+	bool reportNow = false;
 	nodeData_s down;
 	memcpy(&down, data, len);
+	printf("NRF RX [0x%02X]\n", down.nodeAddress);
+
+	//Check of this is not my data
+	if(down.nodeAddress != NODE_ADDRESS)
+	{
+		if(down.nodeAddress == 0xFF)
+		{
+			reportNow = true;
+		}
+		else
+			return false;
+	}
+
+	if(down.frameType == ACKNOWLEDGE)
+	{
+		printf("Main: " GREEN("ACK\n"));
+		return false;
+	}
+
+	printf("RCV Type# %d\n", (int)down.frameType);
+	//printf(" PAYLOAD: %d\n", len);
+	//diag_dump_buf(data, len);
+
 	int hour = (down.timestamp >> 8) & 0xFF;
 	int min = (down.timestamp) & 0xFF;
 	printf("Set time %d:%d\n", hour, min);
@@ -217,18 +281,34 @@ bool NRFreceivedCB(int pipe, uint8_t *data, int len)
 	sTime.Hours = hour;
 	sTime.Minutes = min;
 	sTime.Seconds = 0;
-	HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+	HAL_StatusTypeDef result = HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+	if(result != HAL_OK)
+		printf("Could not set Time!!! %d\n", result);
+
+
+	int month = (down.timestamp >> 24) & 0xFF;
+	int day = (down.timestamp >> 16) & 0xFF;
+	printf("Set date %d:%d\n", month, day);
+
+	RTC_DateTypeDef sDate;
+	HAL_RTC_GetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+	sDate.Month = month;
+	sDate.Date = day;
+	result = HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+	if(result != HAL_OK)
+		printf("Could not set Date!!! %d\n", result);
 
 	//Broadcast pipe
-	if(pipe == 1)
+	if(reportNow)
 	{
-		report(netAddress);
+		reportToServer = true;
 	}
 
 	//command to node
-	if(pipe == 0)
+	if(down.frameType == COMMAND)
 	{
-		printf("Set something %d\n", down.outputs);
+		printf("Set Outputs %d\n", down.outputs);
+
 	}
 
 	return false;
@@ -274,12 +354,6 @@ int main(void)
   MX_ADC1_Init();
   MX_TIM2_Init();
 
-  if(HAL_GPIO_ReadPin(NRF_ADDR0_GPIO_Port, NRF_ADDR0_Pin) == GPIO_PIN_RESET)
-	  netAddress[0] |= 0x01;
-
-  if(HAL_GPIO_ReadPin(NRF_ADDR1_GPIO_Port, NRF_ADDR1_Pin) == GPIO_PIN_RESET)
-	  netAddress[0] |= 0x02;
-
   InterfaceNRF24::init(&hspi1, netAddress, 3);
   InterfaceNRF24::get()->setRXcb(NRFreceivedCB);
 
@@ -291,13 +365,23 @@ int main(void)
   HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, GPIO_PIN_SET);
 
   printf("DriveWay House started\n");
+  printf("Node address: 0x%02X\n", NODE_ADDRESS);
 
   /* Infinite loop */
   while (1)
   {
 	  terminal_run();
-	  motors.run();
 	  InterfaceNRF24::get()->run();
+
+	  motors.run();
+
+	  if(reportToServer)
+	  {
+		  //before transmitting wait 200 ms intervals of node address
+		  HAL_Delay(200 + (NODE_ADDRESS * 200));
+		  reportNow();
+		  reportToServer = false;
+	  }
 
       HAL_Delay(100);
       HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
@@ -483,18 +567,6 @@ static void MX_GPIO_Init(void)
 	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
 	GPIO_InitStruct.Pull = GPIO_PULLUP;
 	HAL_GPIO_Init(NRF_IRQ_GPIO_Port, &GPIO_InitStruct);
-
-	/*Configure GPIO pin : NRF_ADDR0_Pin */
-	GPIO_InitStruct.Pin = NRF_ADDR0_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-	GPIO_InitStruct.Pull = GPIO_PULLUP;
-	HAL_GPIO_Init(NRF_ADDR0_GPIO_Port, &GPIO_InitStruct);
-
-	/*Configure GPIO pin : NRF_ADDR1_Pin */
-	GPIO_InitStruct.Pin = NRF_ADDR1_Pin;
-	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-	GPIO_InitStruct.Pull = GPIO_PULLUP;
-	HAL_GPIO_Init(NRF_ADDR1_GPIO_Port, &GPIO_InitStruct);
 
 	/*Configure GATE GPIO pin : GATE_IN1_Pin */
 	GPIO_InitStruct.Pin = GATE_IN1_Pin;
