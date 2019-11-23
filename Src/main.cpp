@@ -55,7 +55,7 @@
 #include "Utils/crc.h"
 #include "Utils/terminal_serial.h"
 #include "stm32f1xx_hal.h"
-
+#include "iwdg.h"
 #include "Utils/terminal.h"
 #include "Utils/utils.h"
 #include "usb_device.h"
@@ -353,7 +353,7 @@ int main(void)
   MX_SPI1_Init();
   MX_ADC1_Init();
   MX_TIM2_Init();
-
+  MX_IWDG_Init();
   InterfaceNRF24::init(&hspi1, netAddress, 3);
   InterfaceNRF24::get()->setRXcb(NRFreceivedCB);
 
@@ -366,7 +366,7 @@ int main(void)
 
   printf("DriveWay House started\n");
   printf("Node address: 0x%02X\n", NODE_ADDRESS);
-
+  MX_IWDG_Refresh();
   /* Infinite loop */
   while (1)
   {
@@ -385,6 +385,7 @@ int main(void)
 
       HAL_Delay(100);
       HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+      MX_IWDG_Refresh();
 
   }
 
